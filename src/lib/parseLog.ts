@@ -1,41 +1,28 @@
-// src/lib/parseLog.ts
-// -----------------------------------------------------------------------------
-// Client for the Supabase `parse-log` Edge Function.
-//
-// Takes a recorded audio file URI, reads it as base64, and POSTs it (plus the
-// user's known habit names + today's date) to the function, which sends it to
-// Gemini and returns clean, structured entries.
-//
-// The Gemini key lives only on the server. The app only ever sends the public
-// Supabase anon key.
-// -----------------------------------------------------------------------------
-
 import { File } from 'expo-file-system';
 
-import { unitToKind } from './metrics';
+import { isValidMeasure, unitToKind } from './metrics';
 
 const SUPABASE_URL = process.env.EXPO_PUBLIC_SUPABASE_URL;
 const SUPABASE_ANON_KEY = process.env.EXPO_PUBLIC_SUPABASE_ANON_KEY;
+const ACCESS_TOKEN = process.env.EXPO_PUBLIC_VOICE_LOG_ACCESS_TOKEN;
+const MAX_AUDIO_BYTES = 8 * 1024 * 1024;
+const REQUEST_TIMEOUT_MS = 30_000;
 
 export type ParsedMeasure = { kind: string; value: number; unit: string | null };
 
-/** One entry as returned by the function (already normalized to measures). */
 export type ParsedEntry = {
   name: string;
   category: string | null;
   measures: ParsedMeasure[];
   raw_text: string;
   confident: boolean;
-  log_date: string; // YYYY-MM-DD
+  log_date: string;
 };
 
-/**
- * Send a recording to the parse-log function and get back structured entries.
- *
- * @param uri          local file URI from the recorder (e.g. file:///.../rec.m4a)
- * @param knownHabits  existing habit names so the model reuses them
- * @param today        "YYYY-MM-DD" used for log_date
- */
+function shortText(value: unknown, maxLength: number): string {
+  return String(value ?? '').trim().slice(0, maxLength);
+}
+
 export async function parseLog(
   uri: string,
   knownHabits: string[],
@@ -43,78 +30,117 @@ export async function parseLog(
   language: string = 'en',
   knownCategories: string[] = []
 ): Promise<ParsedEntry[]> {
-  if (!SUPABASE_URL || !SUPABASE_ANON_KEY || SUPABASE_ANON_KEY.startsWith('PASTE_')) {
-    throw new Error(
-      'Supabase is not configured. Add EXPO_PUBLIC_SUPABASE_URL and ' +
-        'EXPO_PUBLIC_SUPABASE_ANON_KEY to .env, then restart with: npx expo start --clear'
-    );
+  if (!SUPABASE_URL || !SUPABASE_ANON_KEY || !ACCESS_TOKEN) {
+    throw new Error('Voice parsing is not configured on this device.');
   }
-  if (!uri) throw new Error('No audio file to send.');
+  if (!uri) throw new Error('No recording was created.');
 
-  // Read the recorded file as a base64 string.
-  const audio = await new File(uri).base64();
+  const file = new File(uri);
+  const controller = new AbortController();
+  const timeout = setTimeout(() => controller.abort(), REQUEST_TIMEOUT_MS);
 
-  // iOS HIGH_QUALITY preset records .m4a (audio/mp4). Fall back by extension.
-  const lower = uri.toLowerCase();
-  const mimeType = lower.endsWith('.wav')
-    ? 'audio/wav'
-    : lower.endsWith('.caf')
-      ? 'audio/x-caf'
-      : 'audio/mp4';
+  try {
+    if (file.size != null && file.size > MAX_AUDIO_BYTES) {
+      throw new Error('The recording is too large. Keep it under 8 MB.');
+    }
+    const audio = await file.base64();
+    if (audio.length > Math.ceil(MAX_AUDIO_BYTES / 3) * 4) {
+      throw new Error('The recording is too large. Keep it under 8 MB.');
+    }
 
-  console.log('[parseLog] uri=', uri, 'mime=', mimeType, 'b64len=', audio.length);
+    const lower = uri.toLowerCase();
+    const mimeType = lower.endsWith('.wav')
+      ? 'audio/wav'
+      : lower.endsWith('.caf')
+        ? 'audio/x-caf'
+        : lower.endsWith('.mp3')
+          ? 'audio/mpeg'
+          : lower.endsWith('.webm')
+            ? 'audio/webm'
+            : 'audio/mp4';
 
-  const res = await fetch(`${SUPABASE_URL}/functions/v1/parse-log`, {
-    method: 'POST',
-    headers: {
-      'Content-Type': 'application/json',
-      Authorization: `Bearer ${SUPABASE_ANON_KEY}`,
-    },
-    body: JSON.stringify({
-      audio,
-      mimeType,
-      known_habits: knownHabits,
-      known_categories: knownCategories,
-      today,
-      language,
-    }),
-  });
+    const res = await fetch(`${SUPABASE_URL}/functions/v1/parse-log`, {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        Authorization: `Bearer ${SUPABASE_ANON_KEY}`,
+        'x-voice-log-token': ACCESS_TOKEN,
+      },
+      body: JSON.stringify({
+        audio,
+        mimeType,
+        known_habits: knownHabits.slice(0, 100),
+        known_categories: knownCategories.slice(0, 100),
+        today,
+        language,
+      }),
+      signal: controller.signal,
+    });
 
-  if (!res.ok) {
-    const detail = await res.text().catch(() => '');
-    console.log('[parseLog] HTTP', res.status, 'detail=', detail);
-    throw new Error(`parse-log failed (${res.status}). ${detail}`);
+    if (!res.ok) {
+      if (res.status === 401) throw new Error('This device is not authorised for voice parsing.');
+      if (res.status === 413) throw new Error('The recording is too large.');
+      if (res.status === 429) throw new Error('Too many recordings. Try again in a minute.');
+      throw new Error('Voice parsing is temporarily unavailable.');
+    }
+
+    const data = (await res.json()) as { entries?: unknown };
+    const list = Array.isArray(data.entries) ? data.entries.slice(0, 20) : [];
+    return list
+      .map((candidate): ParsedEntry | null => {
+        const e =
+          candidate && typeof candidate === 'object'
+            ? (candidate as Record<string, unknown>)
+            : {};
+        const rawMeasures = Array.isArray(e.measures) ? e.measures.slice(0, 12) : [];
+        const measures = rawMeasures.flatMap((candidateMeasure): ParsedMeasure[] => {
+          const m =
+            candidateMeasure && typeof candidateMeasure === 'object'
+              ? (candidateMeasure as Record<string, unknown>)
+              : {};
+          const parsed: ParsedMeasure = {
+            kind: shortText(m.kind, 20).toLowerCase(),
+            value: typeof m.value === 'number' ? m.value : Number.NaN,
+            unit: m.unit == null || shortText(m.unit, 20) === ''
+              ? null
+              : shortText(m.unit, 20).toLowerCase(),
+          };
+          return isValidMeasure(parsed) && parsed.value <= 1_000_000 ? [parsed] : [];
+        });
+
+        if (rawMeasures.length === 0 && typeof e.quantity === 'number') {
+          const legacy: ParsedMeasure = {
+            kind: unitToKind(e.unit == null ? null : String(e.unit)),
+            value: e.quantity,
+            unit: e.unit == null ? null : shortText(e.unit, 20).toLowerCase(),
+          };
+          if (isValidMeasure(legacy)) measures.push(legacy);
+        }
+
+        const name = shortText(e.name, 80);
+        if (!name) return null;
+        const category = shortText(e.category, 80);
+        return {
+          name,
+          category: category || null,
+          measures,
+          raw_text: shortText(e.raw_text, 500),
+          confident: e.confident !== false,
+          log_date: today,
+        };
+      })
+      .filter((entry): entry is ParsedEntry => entry !== null);
+  } catch (error) {
+    if (error instanceof Error && error.name === 'AbortError') {
+      throw new Error('Voice parsing timed out. Please try again.');
+    }
+    throw error;
+  } finally {
+    clearTimeout(timeout);
+    try {
+      file.delete();
+    } catch {
+      // The recorder may already have cleaned up its temporary file.
+    }
   }
-
-  const data = (await res.json()) as { entries?: any[] };
-  const list = Array.isArray(data.entries) ? data.entries : [];
-  const entries: ParsedEntry[] = list
-    .map((e: any) => {
-      // Prefer the new `measures` array; fall back to a legacy single quantity/unit.
-      const measures: ParsedMeasure[] = Array.isArray(e?.measures)
-        ? e.measures
-            .filter((m: any) => m && typeof m.value === 'number' && Number.isFinite(m.value))
-            .map((m: any) => ({
-              kind: String(m.kind ?? 'count'),
-              value: m.value,
-              unit: m.unit != null && String(m.unit).trim() !== '' ? String(m.unit) : null,
-            }))
-        : typeof e?.quantity === 'number' && Number.isFinite(e.quantity)
-          ? [{ kind: unitToKind(e?.unit ?? null), value: e.quantity, unit: e?.unit ?? null }]
-          : [];
-      const category =
-        e?.category != null && String(e.category).trim() !== '' ? String(e.category).trim() : null;
-      return {
-        name: String(e?.name ?? '').trim(),
-        category,
-        measures,
-        raw_text: String(e?.raw_text ?? ''),
-        confident: e?.confident !== false,
-        log_date: typeof e?.log_date === 'string' && e.log_date ? e.log_date : today,
-      };
-    })
-    .filter((e: ParsedEntry) => e.name.length > 0);
-
-  console.log('[parseLog] OK entries=', JSON.stringify(entries));
-  return entries;
 }

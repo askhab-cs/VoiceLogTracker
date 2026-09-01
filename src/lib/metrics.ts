@@ -1,16 +1,3 @@
-// src/lib/metrics.ts
-// -----------------------------------------------------------------------------
-// The "measurement" vocabulary shared by the whole app.
-//
-// An entry (one logged activity) can carry several measures. Each measure is a
-// { kind, value, unit }: e.g. a bench-press set is three measures —
-// { sets: 3 }, { reps: 10 }, { weight: 80, unit: 'kg' }. Reading can be logged
-// as { duration: 30, unit: 'min' } one day and { pages: 20 } the next.
-//
-// This file is pure data + helpers (no React / SQLite) so both the database
-// layer and the UI can import it safely.
-// -----------------------------------------------------------------------------
-
 export type MetricKind =
   | 'duration'
   | 'pages'
@@ -58,6 +45,58 @@ export const METRIC_ORDER: MetricKind[] = [
   'calories',
   'count',
 ];
+
+const UNIT_FACTORS: Partial<Record<MetricKind, Record<string, number>>> = {
+  duration: { min: 1, hr: 60 },
+  distance: { km: 1, mi: 1.609344 },
+  weight: { kg: 1, lb: 0.45359237 },
+  calories: { kcal: 1 },
+};
+
+export function isMetricKind(kind: string): kind is MetricKind {
+  return Object.prototype.hasOwnProperty.call(METRICS, kind);
+}
+
+export function canonicalUnit(kind: string): string | null {
+  return metricDef(kind).defaultUnit;
+}
+
+/** Convert compatible values through the metric's canonical unit. */
+export function convertMetricValue(
+  kind: string,
+  value: number,
+  fromUnit: string | null,
+  toUnit: string | null = canonicalUnit(kind)
+): number {
+  if (!Number.isFinite(value)) return 0;
+  const factors = UNIT_FACTORS[kind as MetricKind];
+  if (!factors) return value;
+  const from = (fromUnit || canonicalUnit(kind) || '').toLowerCase();
+  const to = (toUnit || canonicalUnit(kind) || '').toLowerCase();
+  const fromFactor = factors[from];
+  const toFactor = factors[to];
+  if (!fromFactor || !toFactor) return value;
+  return (value * fromFactor) / toFactor;
+}
+
+export function normalizeMeasure(m: Measure): Measure {
+  const kind = isMetricKind(m.kind) ? m.kind : 'count';
+  const def = metricDef(kind);
+  const unit = def.hasUnit ? def.defaultUnit : kind === 'count' ? m.unit : null;
+  return {
+    kind,
+    value: convertMetricValue(kind, m.value, m.unit, unit),
+    unit,
+  };
+}
+
+export function isValidMeasure(m: Measure): boolean {
+  if (!isMetricKind(m.kind) || !Number.isFinite(m.value) || m.value <= 0) return false;
+  const def = metricDef(m.kind);
+  if (!def.hasUnit) return m.unit == null || m.kind === 'count';
+  const unit = (m.unit || def.defaultUnit || '').toLowerCase();
+  return def.units.includes(unit);
+}
 
 export function metricDef(kind: string): MetricDef {
   return (METRICS as Record<string, MetricDef>)[kind] ?? METRICS.count;

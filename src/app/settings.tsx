@@ -1,6 +1,5 @@
 import { Ionicons } from '@expo/vector-icons';
-import { Alert, ScrollView, StyleSheet, Text, View } from 'react-native';
-import { Pressable } from 'react-native';
+import { Alert, Pressable, ScrollView, StyleSheet, Text, View } from 'react-native';
 import { SafeAreaView } from 'react-native-safe-area-context';
 
 import { LANG_OPTIONS, useI18n } from '@/lib/i18n';

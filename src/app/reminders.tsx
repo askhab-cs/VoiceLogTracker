@@ -27,11 +27,9 @@ const C = {
   accent: '#18181B',
 };
 
-function formatTime(hour: number, minute: number): string {
-  const m = hour >= 12 ? 'PM' : 'AM';
-  let hr = hour % 12;
-  if (hr === 0) hr = 12;
-  return `${hr}:${String(minute).padStart(2, '0')} ${m}`;
+export function formatTime(hour: number, minute: number, locale: string): string {
+  const date = new Date(2023, 0, 1, hour, minute);
+  return date.toLocaleTimeString(locale, { hour: 'numeric', minute: '2-digit' });
 }
 
 export default function RemindersScreen() {
@@ -75,6 +73,8 @@ export default function RemindersScreen() {
     if (saved.enabled) {
       const granted = await ensureNotificationPermission();
       if (!granted) {
+        setReminderEnabled(saved.id, false);
+        refresh();
         Alert.alert(t('notifOffTitle'), t('notifOffBodySave'));
         return;
       }
@@ -97,6 +97,8 @@ export default function RemindersScreen() {
     if (value) {
       const granted = await ensureNotificationPermission();
       if (!granted) {
+        setReminderEnabled(r.id, false);
+        refresh();
         Alert.alert(t('notifOffTitle'), t('notifOffBodyToggle'));
         return;
       }
@@ -125,7 +127,7 @@ export default function RemindersScreen() {
               style={({ pressed }) => [styles.card, styles.row, pressed && styles.pressed]}>
               <View style={styles.rowLeft}>
                 <Text style={[styles.time, !r.enabled && styles.dim]}>
-                  {formatTime(r.hour, r.minute)}
+                  {formatTime(r.hour, r.minute, locale)}
                 </Text>
                 <Text style={[styles.label, !r.enabled && styles.dim]} numberOfLines={1}>
                   {r.label}

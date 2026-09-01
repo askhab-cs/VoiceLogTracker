@@ -1,56 +1,106 @@
-# Welcome to your Expo app 👋
+# Voice Log
 
-This is an [Expo](https://expo.dev) project created with [`create-expo-app`](https://www.npmjs.com/package/create-expo-app).
+I built Voice Log because I kept putting off habit tracking. The activity itself
+was easy; opening a tracker and typing every exercise, set, page, or minute was
+the part I avoided. Speaking one short recap felt much more natural.
 
-## Get started
+Tap the mic and say something like: “I read 25 pages, then did four sets of bench
+press at 80 kilos.” Voice Log turns that into separate, editable entries and
+keeps the progress on the device.
 
-1. Install dependencies
+![15-second Voice Log microphone demo](docs/voice-log-demo.gif)
 
-   ```bash
-   npm install
-   ```
+## How it works
 
-2. Start the app
+The voice path is **Expo → Supabase → Gemini → SQLite**:
 
-   ```bash
-   npx expo start
-   ```
+1. The Expo app records a short audio clip.
+2. A Supabase Edge Function checks the personal access token, file size, format,
+   rate limit, and request fields.
+3. Gemini transcribes the clip and returns structured activities and measures.
+4. The app shows the proposed entries for confirmation, then writes the approved
+   data to SQLite.
 
-In the output, you'll find options to open the app in a
+The recording is a temporary file and is deleted after the request. Habit
+history, goals, categories, streaks, and reminders stay in the local SQLite
+database. The Gemini API key only exists as a Supabase secret.
 
-- [development build](https://docs.expo.dev/develop/development-builds/introduction/)
-- [Android emulator](https://docs.expo.dev/workflow/android-studio-emulator/)
-- [iOS simulator](https://docs.expo.dev/workflow/ios-simulator/)
-- [Expo Go](https://expo.dev/go), a limited sandbox for trying out app development with Expo
+## What is included
 
-You can start developing by editing the files inside the **app** directory. This project uses [file-based routing](https://docs.expo.dev/router/introduction).
+- voice entry in English, Russian, and Arabic
+- manual add/edit/delete as a fallback
+- multiple measures per activity: duration, distance, pages, sets, reps, weight,
+  calories, and custom counts
+- unit-safe progress totals (hours/minutes, miles/kilometres, and pounds/kilos)
+- weekly goals, streaks, categories, and local reminders
+- a review step before speech results are saved, plus an immediate undo
+- 15 unit tests covering metric conversion, validation, dates, streaks, and goal
+  calculations
+- lint, TypeScript, tests, and a production web export in GitHub Actions
 
-## Get a fresh project
+## Run it locally
 
-When you're ready, run:
+You need Node.js 22+, Expo Go or a simulator, a Supabase project, and a Gemini
+API key.
 
 ```bash
-npm run reset-project
+npm install
+cp .env.example .env
 ```
 
-This command will move the starter code to the **app-example** directory and create a blank **app** directory where you can start developing.
+Fill in the three values in `.env`:
 
-### Other setup steps
+```dotenv
+EXPO_PUBLIC_SUPABASE_URL=https://YOUR_PROJECT.supabase.co
+EXPO_PUBLIC_SUPABASE_ANON_KEY=YOUR_SUPABASE_ANON_KEY
+EXPO_PUBLIC_VOICE_LOG_ACCESS_TOKEN=THE_SAME_LONG_RANDOM_VALUE_USED_ON_SUPABASE
+```
 
-- To set up ESLint for linting, run `npx expo lint`, or follow our guide on ["Using ESLint and Prettier"](https://docs.expo.dev/guides/using-eslint/)
-- If you'd like to set up unit testing, follow our guide on ["Unit Testing with Jest"](https://docs.expo.dev/develop/unit-testing/)
-- Learn more about the TypeScript setup in this template in our guide on ["Using TypeScript"](https://docs.expo.dev/guides/typescript/)
+Set the private Edge Function secrets and deploy:
 
-## Learn more
+```bash
+npx supabase login
+npx supabase link --project-ref YOUR_PROJECT_REF
+npx supabase secrets set GEMINI_API_KEY=YOUR_GEMINI_KEY
+npx supabase secrets set VOICE_LOG_ACCESS_TOKEN=YOUR_LONG_RANDOM_VALUE
+npx supabase secrets set ALLOWED_ORIGIN=http://localhost:8081
+npx supabase functions deploy parse-log
+npx expo start --clear
+```
 
-To learn more about developing your project with Expo, look at the following resources:
+`ALLOWED_ORIGIN` is only needed for the web client; use the exact deployed web
+origin in production. Native requests do not rely on browser CORS.
 
-- [Expo documentation](https://docs.expo.dev/): Learn fundamentals, or go into advanced topics with our [guides](https://docs.expo.dev/guides).
-- [Learn Expo tutorial](https://docs.expo.dev/tutorial/introduction/): Follow a step-by-step tutorial where you'll create a project that runs on Android, iOS, and the web.
+## Privacy and security
 
-## Join the community
+No working keys or project values belong in Git. `.env`, Supabase local state,
+mobile signing files, and service configuration files are ignored.
 
-Join our community of developers creating universal apps.
+The Supabase anon key is designed to be public. The additional access token makes
+the deployed function private enough for my own non-distributed build, but an
+`EXPO_PUBLIC_...` value is still bundled into a shipped app and can be
+extracted. If this becomes a public product, the next security step is Supabase
+Auth with per-user JWT validation and server-side quotas; a bundled token should
+not be treated as user authentication.
 
-- [Expo on GitHub](https://github.com/expo/expo): View our open source platform and contribute.
-- [Discord community](https://chat.expo.dev): Chat with Expo users and ask questions.
+Audio leaves the device only after the first-use disclosure is accepted. It goes
+to the owner's Supabase function and then to Google Gemini. The function does not
+store the audio, and the app removes its temporary copy after processing.
+
+## Checks
+
+```bash
+npm run verify
+```
+
+That runs ESLint, TypeScript, all 15 Vitest tests, and the Expo web export.
+
+## Current limits
+
+- Voice parsing needs a network connection.
+- Gemini can mishear speech, so every proposed entry must be reviewed.
+- The web SQLite driver needs cross-origin isolation headers. The included Expo
+  Router and Metro configuration supplies them; embedded previews that disable
+  `SharedArrayBuffer` fall back to a non-persistent empty preview.
+- This is currently a personal, single-device app. There is no account sync or
+  cloud backup.

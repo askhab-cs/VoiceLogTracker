@@ -6,6 +6,7 @@ import {
   useAudioRecorder,
   useAudioRecorderState,
 } from 'expo-audio';
+import { File } from 'expo-file-system';
 import { useEffect, useRef, useState } from 'react';
 import {
   ActivityIndicator,
@@ -135,7 +136,17 @@ export default function MicButton({
       await recorder.stop();
       await setAudioModeAsync({ allowsRecording: false });
       const uri = recorder.uri ?? '';
-      if (onComplete) await onComplete(uri);
+      try {
+        if (onComplete) await onComplete(uri);
+      } finally {
+        if (uri) {
+          try {
+            new File(uri).delete();
+          } catch {
+            // Temporary recordings may already have been removed after upload.
+          }
+        }
+      }
     } catch (e: any) {
       Alert.alert(t('couldNotSaveTitle'), String(e?.message ?? e));
     } finally {
@@ -164,6 +175,9 @@ export default function MicButton({
         <Pressable
           onPress={handlePress}
           disabled={status === 'processing'}
+          accessibilityRole="button"
+          accessibilityLabel={isRecording ? t('stopRecording') : t('startRecording')}
+          accessibilityState={{ disabled: status === 'processing', busy: status === 'processing' }}
           style={({ pressed }) => [
             styles.mic,
             pressed && styles.micPressed,

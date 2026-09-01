@@ -1,6 +1,13 @@
 import * as SQLite from 'expo-sqlite';
 
-import { metricDef, unitToKind, type Measure } from './metrics';
+import {
+  convertMetricValue,
+  isValidMeasure,
+  metricDef,
+  normalizeMeasure,
+  unitToKind,
+  type Measure,
+} from './metrics';
 
 /* ------------------------------------------------------------------ */
 /* Types                                                              */
@@ -28,16 +35,36 @@ export type NewEntry = {
   measures?: MeasureInput[];
   // string → set/keep category; null → clear it; undefined → leave untouched
   category?: string | null;
+  updateHabitCategory?: boolean;
 };
 
 /* ------------------------------------------------------------------ */
 /* Connection + schema                                               */
 /* ------------------------------------------------------------------ */
-const db = SQLite.openDatabaseSync('voicelog.db');
+function unavailableWebDatabase(): SQLite.SQLiteDatabase {
+  return {
+    execSync: () => undefined,
+    getAllSync: () => [],
+    getFirstSync: () => null,
+    runSync: () => ({ lastInsertRowId: 0, changes: 0 }),
+    withTransactionSync: (task: () => void) => task(),
+  } as unknown as SQLite.SQLiteDatabase;
+}
+
+let db: SQLite.SQLiteDatabase;
+try {
+  db = SQLite.openDatabaseSync('voicelog.db');
+} catch {
+  // Some embedded webviews disable SharedArrayBuffer. Native builds and
+  // cross-origin-isolated browsers continue to use SQLite normally.
+  db = unavailableWebDatabase();
+}
 
 export function initDb() {
-  db.execSync(`
+  try {
+    db.execSync(`
     PRAGMA journal_mode = WAL;
+    PRAGMA foreign_keys = ON;
     CREATE TABLE IF NOT EXISTS habits (
       id   INTEGER PRIMARY KEY AUTOINCREMENT,
       name TEXT NOT NULL UNIQUE
@@ -89,13 +116,16 @@ export function initDb() {
     );
   `);
 
-  // Goals gained a "metric" column (which measure an amount-goal tracks).
-  ensureColumn('goals', 'metric', 'metric TEXT');
-  // Habits gained a "category" column (the group they belong to).
-  ensureColumn('habits', 'category', 'category TEXT');
+    // Goals gained a "metric" column (which measure an amount-goal tracks).
+    ensureColumn('goals', 'metric', 'metric TEXT');
+    // Habits gained a "category" column (the group they belong to).
+    ensureColumn('habits', 'category', 'category TEXT');
 
-  seedIfEmpty();
-  migrateLegacyMeasures();
+    migrateLegacyMeasures();
+  } catch (error) {
+    if (process.env.EXPO_OS !== 'web') throw error;
+    db = unavailableWebDatabase();
+  }
 }
 
 /** Add a column if the table doesn't already have it (SQLite has no IF NOT EXISTS for columns). */
@@ -163,12 +193,16 @@ export function getHabitNames(): string[] {
 }
 
 /**
- * Find or create a habit, optionally (re)assigning its category.
+ * Find or create a habit. Existing categories change only after an explicit edit.
  * - category `undefined` → leave any existing category untouched.
  * - category `""`/whitespace → treated as null.
- * - category set → create with it, or update an existing habit to match.
+ * - category set → create with it; update an existing habit only when requested.
  */
-export function getOrCreateHabit(name: string, category?: string | null): number {
+export function getOrCreateHabit(
+  name: string,
+  category?: string | null,
+  updateExistingCategory = false
+): number {
   const norm =
     category === undefined ? undefined : category && category.trim() ? category.trim() : null;
   const existing = db.getFirstSync<{ id: number; category: string | null }>(
@@ -176,7 +210,7 @@ export function getOrCreateHabit(name: string, category?: string | null): number
     [name]
   );
   if (existing) {
-    if (norm !== undefined && norm !== existing.category) {
+    if (updateExistingCategory && norm !== undefined && norm !== existing.category) {
       db.runSync('UPDATE habits SET category = ? WHERE id = ?', [norm, existing.id]);
     }
     return existing.id;
@@ -226,7 +260,8 @@ function insertMeasures(entryId: number, measures: MeasureInput[] | undefined) {
   if (!measures) return;
   let pos = 0;
   for (const m of measures) {
-    if (typeof m.value !== 'number' || !Number.isFinite(m.value)) continue;
+    const candidate: Measure = { kind: m.kind, value: m.value, unit: m.unit ?? null };
+    if (!isValidMeasure(candidate)) continue;
     db.runSync('INSERT INTO measures (entry_id, kind, value, unit, pos) VALUES (?, ?, ?, ?, ?)', [
       entryId,
       m.kind,
@@ -238,29 +273,45 @@ function insertMeasures(entryId: number, measures: MeasureInput[] | undefined) {
 }
 
 export function addEntry(e: NewEntry): number {
-  const habitId = getOrCreateHabit(e.name, e.category);
-  const res = db.runSync(
-    `INSERT INTO entries (habit_id, log_date, raw_text, confident) VALUES (?, ?, ?, ?)`,
-    [habitId, e.logDate, e.rawText, e.confident === false ? 0 : 1]
-  );
-  const id = res.lastInsertRowId;
-  insertMeasures(id, e.measures);
+  let id = 0;
+  db.withTransactionSync(() => {
+    const habitId = getOrCreateHabit(e.name, e.category, e.updateHabitCategory === true);
+    const res = db.runSync(
+      `INSERT INTO entries (habit_id, log_date, raw_text, confident) VALUES (?, ?, ?, ?)`,
+      [habitId, e.logDate, e.rawText, e.confident === false ? 0 : 1]
+    );
+    id = res.lastInsertRowId;
+    insertMeasures(id, e.measures);
+  });
   return id;
 }
 
 export function deleteEntry(id: number): void {
-  db.runSync('DELETE FROM measures WHERE entry_id = ?', [id]);
-  db.runSync('DELETE FROM entries WHERE id = ?', [id]);
+  db.withTransactionSync(() => {
+    const entry = db.getFirstSync<{ habit_id: number }>('SELECT habit_id FROM entries WHERE id = ?', [id]);
+    db.runSync('DELETE FROM entries WHERE id = ?', [id]);
+    if (!entry) return;
+    const remaining = db.getFirstSync<{ c: number }>(
+      'SELECT COUNT(*) AS c FROM entries WHERE habit_id = ?',
+      [entry.habit_id]
+    );
+    if ((remaining?.c ?? 0) === 0) {
+      db.runSync('DELETE FROM goals WHERE habit_id = ?', [entry.habit_id]);
+      db.runSync('DELETE FROM habits WHERE id = ?', [entry.habit_id]);
+    }
+  });
 }
 
 export function updateEntry(
   id: number,
-  e: { name: string; measures?: MeasureInput[]; category?: string | null }
+  e: { name: string; measures?: MeasureInput[]; category?: string | null; updateHabitCategory?: boolean }
 ): void {
-  const habitId = getOrCreateHabit(e.name, e.category);
-  db.runSync('UPDATE entries SET habit_id = ? WHERE id = ?', [habitId, id]);
-  db.runSync('DELETE FROM measures WHERE entry_id = ?', [id]);
-  insertMeasures(id, e.measures);
+  db.withTransactionSync(() => {
+    const habitId = getOrCreateHabit(e.name, e.category, e.updateHabitCategory === true);
+    db.runSync('UPDATE entries SET habit_id = ? WHERE id = ?', [habitId, id]);
+    db.runSync('DELETE FROM measures WHERE entry_id = ?', [id]);
+    insertMeasures(id, e.measures);
+  });
 }
 
 export function getEntriesForDate(date: string): EntryRow[] {
@@ -308,7 +359,10 @@ export function getMonthEntryCount(yearMonthPrefix: string): number {
 
 /** Consecutive-day streak ending today (or yesterday if today is empty). */
 export function getStreak(today: Date): number {
-  const logged = getLoggedDates();
+  return calculateStreak(getLoggedDates(), today);
+}
+
+export function calculateStreak(logged: Set<string>, today: Date): number {
   const cursor = new Date(today);
   if (!logged.has(toDateStr(cursor))) cursor.setDate(cursor.getDate() - 1);
   let streak = 0;
@@ -319,59 +373,15 @@ export function getStreak(today: Date): number {
   return streak;
 }
 
-export function clearAll() {
-  db.execSync('DELETE FROM measures; DELETE FROM entries; DELETE FROM habits;');
+export function startOfWeek(date: Date): Date {
+  const result = new Date(date);
+  result.setHours(0, 0, 0, 0);
+  result.setDate(result.getDate() - ((result.getDay() + 6) % 7));
+  return result;
 }
 
-/* ------------------------------------------------------------------ */
-/* First-run seed (demo data so the screen looks alive)              */
-/* ------------------------------------------------------------------ */
-function seedIfEmpty() {
-  const row = db.getFirstSync<{ c: number }>('SELECT COUNT(*) AS c FROM habits');
-  if ((row?.c ?? 0) > 0) return;
-
-  const today = new Date();
-  const dayAgo = (n: number) => {
-    const dt = new Date(today);
-    dt.setDate(dt.getDate() - n);
-    return toDateStr(dt);
-  };
-
-  type SeedEntry = { name: string; category?: string; rawText: string; measures?: MeasureInput[] };
-  const G = 'Gym';
-  const S = 'Study';
-  const plan: [number, SeedEntry[]][] = [
-    [0, [
-      { name: 'Reading', rawText: 'read my book for about two hours', measures: [{ kind: 'duration', value: 120, unit: 'min' }] },
-      { name: 'Bench Press', category: G, rawText: 'bench press, 4 sets of 8 at 80 kilos', measures: [{ kind: 'sets', value: 4 }, { kind: 'reps', value: 8 }, { kind: 'weight', value: 80, unit: 'kg' }] },
-      { name: 'Squat', category: G, rawText: 'squats, 5 by 5 at a hundred', measures: [{ kind: 'sets', value: 5 }, { kind: 'reps', value: 5 }, { kind: 'weight', value: 100, unit: 'kg' }] },
-      { name: 'Treadmill', category: G, rawText: 'finished with 15 minutes on the treadmill', measures: [{ kind: 'duration', value: 15, unit: 'min' }] },
-    ]],
-    [1, [
-      { name: 'Reading', rawText: 'read 25 pages before bed', measures: [{ kind: 'pages', value: 25 }] },
-      { name: 'Calculus', category: S, rawText: 'calculus lecture and problem set', measures: [{ kind: 'duration', value: 45, unit: 'min' }] },
-      { name: 'Physics', category: S, rawText: 'reviewed physics notes', measures: [{ kind: 'duration', value: 30, unit: 'min' }] },
-    ]],
-    [2, [
-      { name: 'Bench Press', category: G, rawText: 'bench press 4 by 8 at 82.5', measures: [{ kind: 'sets', value: 4 }, { kind: 'reps', value: 8 }, { kind: 'weight', value: 82.5, unit: 'kg' }] },
-      { name: 'Meditation', rawText: 'meditated in the morning', measures: [{ kind: 'duration', value: 10, unit: 'min' }] },
-    ]],
-    [3, [{ name: 'Reading', rawText: 'a chapter on habits', measures: [{ kind: 'pages', value: 18 }] }]],
-    [5, [{ name: 'Running', rawText: 'easy jog', measures: [{ kind: 'distance', value: 3, unit: 'km' }] }]],
-    [6, [
-      { name: 'Squat', category: G, rawText: 'squats 5 by 5 at 102.5', measures: [{ kind: 'sets', value: 5 }, { kind: 'reps', value: 5 }, { kind: 'weight', value: 102.5, unit: 'kg' }] },
-      { name: 'Reading', rawText: 'a few pages', measures: [{ kind: 'duration', value: 20, unit: 'min' }] },
-    ]],
-    [9, [{ name: 'Meditation', rawText: 'guided session', measures: [{ kind: 'duration', value: 15, unit: 'min' }] }]],
-    [12, [{ name: 'Reading', rawText: 'finished a chapter', measures: [{ kind: 'duration', value: 50, unit: 'min' }] }]],
-    [14, [{ name: 'Bench Press', category: G, rawText: 'bench 4 by 8 at 78', measures: [{ kind: 'sets', value: 4 }, { kind: 'reps', value: 8 }, { kind: 'weight', value: 78, unit: 'kg' }] }]],
-  ];
-
-  for (const [n, entries] of plan) {
-    const logDate = dayAgo(n);
-    for (const e of entries)
-      addEntry({ name: e.name, category: e.category, rawText: e.rawText, logDate, measures: e.measures });
-  }
+export function clearAll() {
+  db.execSync('DELETE FROM measures; DELETE FROM entries; DELETE FROM habits;');
 }
 
 /* ------------------------------------------------------------------ */
@@ -434,7 +444,7 @@ export type HabitStat = {
   category: string | null;
   total: number; // all-time entries
   streak: number; // consecutive days ending today/yesterday
-  weekDays: number; // distinct days logged this week (Sun→today)
+  weekDays: number; // distinct days logged this week (Mon→today)
   last7: boolean[]; // index 0 = 6 days ago … 6 = today
   goal: Goal | null;
   metrics: MetricAgg[]; // ordered by frequency
@@ -461,8 +471,7 @@ export function getHabitStats(): HabitStat[] {
 
   const today = new Date();
   const todayStr = toDateStr(today);
-  const weekStart = new Date(today);
-  weekStart.setDate(today.getDate() - today.getDay());
+  const weekStart = startOfWeek(today);
   const weekStartStr = toDateStr(weekStart);
 
   const last7Dates: string[] = [];
@@ -498,27 +507,28 @@ export function getHabitStats(): HabitStat[] {
   };
   const habitMetrics = new Map<number, Map<string, MAcc>>();
   for (const r of measRows) {
+    const normalized = normalizeMeasure({ kind: r.kind, value: r.value, unit: r.unit });
     let mm = habitMetrics.get(r.habit_id);
     if (!mm) {
       mm = new Map();
       habitMetrics.set(r.habit_id, mm);
     }
-    let a = mm.get(r.kind);
+    let a = mm.get(normalized.kind);
     if (!a) {
       a = { unitCounts: new Map(), count: 0, weekSum: 0, weekMax: 0, totalSum: 0, best: 0, last: 0, lastDate: '' };
-      mm.set(r.kind, a);
+      mm.set(normalized.kind, a);
     }
     a.count += 1;
-    a.totalSum += r.value;
-    if (r.value > a.best) a.best = r.value;
-    if (r.unit) a.unitCounts.set(r.unit, (a.unitCounts.get(r.unit) ?? 0) + 1);
+    a.totalSum += normalized.value;
+    if (normalized.value > a.best) a.best = normalized.value;
+    if (normalized.unit) a.unitCounts.set(normalized.unit, (a.unitCounts.get(normalized.unit) ?? 0) + 1);
     if (r.log_date >= weekStartStr && r.log_date <= todayStr) {
-      a.weekSum += r.value;
-      if (r.value > a.weekMax) a.weekMax = r.value;
+      a.weekSum += normalized.value;
+      if (normalized.value > a.weekMax) a.weekMax = normalized.value;
     }
     if (r.log_date >= a.lastDate) {
       a.lastDate = r.log_date;
-      a.last = r.value;
+      a.last = normalized.value;
     }
   }
 
@@ -592,8 +602,11 @@ export function goalProgress(stat: HabitStat): { current: number; target: number
   const kind = goal.metric ?? stat.primary?.kind ?? null;
   const m = kind ? stat.metrics.find((x) => x.kind === kind) : null;
   const current = m ? (metricDef(m.kind).agg === 'max' ? m.weekMax : m.weekSum) : 0;
-  const target = goal.target || 1;
-  return { current, target: goal.target, pct: current / target };
+  const convertedTarget = m
+    ? convertMetricValue(m.kind, goal.target, goal.unit, m.unit)
+    : goal.target;
+  const divisor = convertedTarget || 1;
+  return { current, target: convertedTarget, pct: current / divisor };
 }
 
 /* ------------------------------------------------------------------ */
@@ -679,8 +692,7 @@ export function deleteReminder(id: number): void {
   db.runSync('DELETE FROM reminders WHERE id = ?', [id]);
 }
 
-// Ensure schema + seed exist before any query runs (child effects fire before
-// parent effects, so we can't rely on a layout-level init).
+// Initialise before screen effects run.
 initDb();
 
 export default db;

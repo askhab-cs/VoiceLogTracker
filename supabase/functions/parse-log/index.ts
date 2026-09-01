@@ -1,61 +1,28 @@
-// supabase/functions/parse-log/index.ts
-//
-// Edge Function: parse-log
-// -----------------------------------------------------------------------------
-// Receives a short voice recording, sends the audio to the Gemini Flash-Lite
-// API together with the system prompt + the user's known habit names + today's
-// date, and returns structured JSON entries.
-//
-// The Gemini API key is read from the function's environment secret
-// (GEMINI_API_KEY) and is NEVER sent from the app.
-//
-// Request (POST) — either of:
-//   • application/json:  { audio: <base64>, mimeType: string,
-//                          known_habits: string[], today: "YYYY-MM-DD" }
-//   • multipart/form-data: fields  audio (file), known_habits (JSON string),
-//                                  today (string)
-//
-// Response (200):  { entries: Entry[] }
-//   Entry = { name, quantity|null, unit|null, raw_text, confident, log_date }
-// -----------------------------------------------------------------------------
-
-import { encodeBase64 } from "https://deno.land/std@0.224.0/encoding/base64.ts";
-
 const GEMINI_API_KEY = Deno.env.get("GEMINI_API_KEY");
 const GEMINI_MODEL = Deno.env.get("GEMINI_MODEL") ?? "gemini-2.5-flash-lite";
+const ACCESS_TOKEN = Deno.env.get("VOICE_LOG_ACCESS_TOKEN");
+const ALLOWED_ORIGIN = Deno.env.get("ALLOWED_ORIGIN");
 
-// --- The system prompt sent with every call (verbatim) ----------------------
-const SYSTEM_PROMPT = `You are the parsing engine for a minimalist voice habit tracker. The user speaks a short, casual summary of what they did today. Turn that messy speech into clean, structured, trackable entries.
+const MAX_AUDIO_BYTES = 8 * 1024 * 1024;
+const MAX_BASE64_LENGTH = Math.ceil(MAX_AUDIO_BYTES / 3) * 4;
+const MAX_CONTEXT_ITEMS = 100;
+const RATE_WINDOW_MS = 60_000;
+const RATE_LIMIT = 10;
 
-Rules:
-- Output ONLY valid JSON matching the schema. No prose, no markdown.
-- Split the speech into separate entries — one per distinct activity.
-- Give each a short, polished, Title Case name (e.g. "Reading", "Running", "Bench Press"). Keep it generic enough to repeat day to day. For gym/workout activities, name the entry after the specific exercise when one is stated (e.g. "Bench Press", "Squat", "Deadlift") so each lift can be tracked over time; otherwise use the general activity (e.g. "Gym").
-- If an activity matches one in \`known_habits\`, reuse that exact name so it groups together over time. Only invent a new name if none fit.
-- Give each entry a \`category\` — the broader group it belongs to — so related activities bundle together. Examples: gym/workout activities (bench press, squat, treadmill, cardio) → "Gym"; school/university subjects or modules (calculus, physics, history) → "Study"; cooking, chores, etc. can share sensible groups too. Reuse a name from \`known_categories\` when one fits. Use the SAME category for activities the user clearly groups together. If an activity stands alone and has no natural group, set \`category\` to null. Keep category names short and Title Case, written in the user's language.
-- Put every number mentioned into the \`measures\` array. Each measure is { "kind", "value", "unit" }:
-    • duration — time spent (unit "min" or "hr")
-    • distance — running/walking distance (unit "km" or "mi")
-    • pages — pages read (no unit)
-    • sets — number of sets (no unit)
-    • reps — repetitions per set (no unit)
-    • weight — load lifted (unit "kg" or "lb")
-    • calories — energy (unit "kcal")
-    • count — any other countable thing (optional unit)
-- A single activity can have several measures. Example: "bench press, three sets of ten at eighty kilos" → name "Bench Press", measures [{"kind":"sets","value":3},{"kind":"reps","value":10},{"kind":"weight","value":80,"unit":"kg"}].
-- The same activity may be measured differently on different days (e.g. reading "thirty minutes" → duration; "twenty pages" → pages). Use whichever kind matches what was said.
-- If no number is mentioned for an activity, use an empty \`measures\` array.
-- Always keep the user's original words in \`raw_text\`.
-- If a phrase is unclear, still create an entry with your best-guess name and set \`confident\` to false.
-- If nothing was logged, return an empty \`entries\` array.
-- Use the provided \`today\` value for \`log_date\`. Never invent dates.`;
+const SYSTEM_PROMPT = `You parse short voice notes for a habit tracker.
+Return only JSON matching the supplied schema.
+Create one entry per distinct activity. Reuse matching known habit and category names.
+Use short, repeatable activity names. Preserve the speaker's words in raw_text.
+Measures may use only: duration (min/hr), pages, distance (km/mi), sets, reps,
+weight (kg/lb), calories (kcal), or count. Use the provided date exactly.
+If the audio contains no activity, return an empty entries array.`;
 
-// --- JSON schema Gemini must return (mirrors the SQLite `entries` table) -----
 const RESPONSE_SCHEMA = {
   type: "object",
   properties: {
     entries: {
       type: "array",
+      maxItems: 20,
       items: {
         type: "object",
         properties: {
@@ -63,10 +30,11 @@ const RESPONSE_SCHEMA = {
           category: { type: "string", nullable: true },
           measures: {
             type: "array",
+            maxItems: 12,
             items: {
               type: "object",
               properties: {
-                kind: { type: "string" }, // duration|pages|distance|sets|reps|weight|calories|count
+                kind: { type: "string" },
                 value: { type: "number" },
                 unit: { type: "string", nullable: true },
               },
@@ -75,125 +43,154 @@ const RESPONSE_SCHEMA = {
           },
           raw_text: { type: "string" },
           confident: { type: "boolean" },
-          log_date: { type: "string" }, // YYYY-MM-DD
+          log_date: { type: "string" },
         },
-        required: ["name", "raw_text", "confident", "log_date"],
+        required: ["name", "measures", "raw_text", "confident", "log_date"],
       },
     },
   },
   required: ["entries"],
 };
 
-const ALLOWED_KINDS = new Set([
-  "duration",
-  "pages",
-  "distance",
-  "sets",
-  "reps",
-  "weight",
-  "calories",
-  "count",
-]);
-
-const CORS = {
-  "Access-Control-Allow-Origin": "*",
-  "Access-Control-Allow-Headers":
-    "authorization, x-client-info, apikey, content-type",
-  "Access-Control-Allow-Methods": "POST, OPTIONS",
+const ALLOWED_UNITS: Record<string, Set<string | null>> = {
+  duration: new Set(["min", "hr"]),
+  pages: new Set([null]),
+  distance: new Set(["km", "mi"]),
+  sets: new Set([null]),
+  reps: new Set([null]),
+  weight: new Set(["kg", "lb"]),
+  calories: new Set(["kcal"]),
+  count: new Set([null]),
 };
+const ALLOWED_MIME_TYPES = new Set([
+  "audio/mp4",
+  "audio/mpeg",
+  "audio/wav",
+  "audio/x-caf",
+  "audio/webm",
+  "audio/ogg",
+]);
+const LANGUAGES: Record<string, string> = {
+  en: "English",
+  ru: "Russian",
+  ar: "Arabic",
+};
+const attempts = new Map<string, { count: number; resetAt: number }>();
 
-function json(body: unknown, status = 200): Response {
+function requestOrigin(req: Request): string | null {
+  const origin = req.headers.get("origin");
+  if (!origin) return null;
+  if (ALLOWED_ORIGIN && origin === ALLOWED_ORIGIN) return origin;
+  return null;
+}
+
+function corsHeaders(req: Request): HeadersInit {
+  const origin = requestOrigin(req);
+  return {
+    ...(origin ? { "Access-Control-Allow-Origin": origin, Vary: "Origin" } : {}),
+    "Access-Control-Allow-Headers":
+      "authorization, x-client-info, apikey, content-type, x-voice-log-token",
+    "Access-Control-Allow-Methods": "POST, OPTIONS",
+  };
+}
+
+function json(req: Request, body: unknown, status = 200): Response {
   return new Response(JSON.stringify(body), {
     status,
-    headers: { "Content-Type": "application/json", ...CORS },
+    headers: { "Content-Type": "application/json", ...corsHeaders(req) },
   });
 }
 
+function safeEqual(left: string, right: string): boolean {
+  if (left.length !== right.length) return false;
+  let difference = 0;
+  for (let i = 0; i < left.length; i += 1) {
+    difference |= left.charCodeAt(i) ^ right.charCodeAt(i);
+  }
+  return difference === 0;
+}
+
+function limitedStrings(value: unknown): string[] {
+  if (!Array.isArray(value)) return [];
+  return value
+    .slice(0, MAX_CONTEXT_ITEMS)
+    .map((item) => String(item).trim().slice(0, 80))
+    .filter(Boolean);
+}
+
+function allowRequest(req: Request): boolean {
+  const key = req.headers.get("x-forwarded-for")?.split(",")[0]?.trim() ?? "unknown";
+  const now = Date.now();
+  const current = attempts.get(key);
+  if (!current || current.resetAt <= now) {
+    attempts.set(key, { count: 1, resetAt: now + RATE_WINDOW_MS });
+    return true;
+  }
+  current.count += 1;
+  return current.count <= RATE_LIMIT;
+}
+
 Deno.serve(async (req: Request) => {
-  if (req.method === "OPTIONS") return new Response("ok", { headers: CORS });
-  if (req.method !== "POST") return json({ error: "Method not allowed" }, 405);
-  if (!GEMINI_API_KEY) return json({ error: "GEMINI_API_KEY is not configured" }, 500);
-
-  // --- 1. Read the request (JSON base64 or multipart file) ------------------
-  let audioBase64 = "";
-  let mimeType = "audio/mp4";
-  let knownHabits: string[] = [];
-  let knownCategories: string[] = [];
-  let today = "";
-  let language = "en";
-
-  try {
-    const contentType = req.headers.get("content-type") ?? "";
-
-    if (contentType.includes("application/json")) {
-      const body = await req.json();
-      audioBase64 = body.audio ?? body.audioBase64 ?? "";
-      mimeType = body.mimeType ?? mimeType;
-      knownHabits = Array.isArray(body.known_habits) ? body.known_habits : [];
-      knownCategories = Array.isArray(body.known_categories) ? body.known_categories : [];
-      today = body.today ?? "";
-      language = body.language ?? "en";
-    } else if (contentType.includes("multipart/form-data")) {
-      const form = await req.formData();
-      const file = form.get("audio");
-      if (file instanceof File) {
-        mimeType = file.type || mimeType;
-        audioBase64 = encodeBase64(new Uint8Array(await file.arrayBuffer()));
-      }
-      const kh = form.get("known_habits");
-      knownHabits = typeof kh === "string" ? JSON.parse(kh) : [];
-      const kc = form.get("known_categories");
-      knownCategories = typeof kc === "string" ? JSON.parse(kc) : [];
-      today = (form.get("today") as string) ?? "";
-      language = (form.get("language") as string) ?? "en";
-    } else {
-      return json({ error: "Unsupported content-type" }, 415);
+  if (req.method === "OPTIONS") {
+    if (req.headers.get("origin") && !requestOrigin(req)) {
+      return json(req, { error: "Origin not allowed" }, 403);
     }
-  } catch (e) {
-    return json({ error: "Invalid request body", detail: String(e) }, 400);
+    return new Response(null, { status: 204, headers: corsHeaders(req) });
+  }
+  if (req.method !== "POST") return json(req, { error: "Method not allowed" }, 405);
+  if (!GEMINI_API_KEY || !ACCESS_TOKEN) {
+    return json(req, { error: "Service is not configured" }, 503);
   }
 
-  if (!audioBase64) return json({ error: "No audio provided" }, 400);
-  if (!today) today = new Date().toISOString().slice(0, 10);
+  const suppliedToken = req.headers.get("x-voice-log-token") ?? "";
+  if (!safeEqual(suppliedToken, ACCESS_TOKEN)) {
+    return json(req, { error: "Unauthorized" }, 401);
+  }
+  if (!allowRequest(req)) return json(req, { error: "Too many requests" }, 429);
 
-  // --- 2. Call Gemini Flash-Lite with audio + prompt + context --------------
-  const LANG_NAMES: Record<string, string> = {
-    en: "English",
-    ru: "Russian",
-    ar: "Arabic",
-  };
-  const langName = LANG_NAMES[language] ?? "English";
+  const declaredLength = Number(req.headers.get("content-length") ?? 0);
+  if (declaredLength > MAX_BASE64_LENGTH + 100_000) {
+    return json(req, { error: "Recording is too large" }, 413);
+  }
+  if (!(req.headers.get("content-type") ?? "").includes("application/json")) {
+    return json(req, { error: "Content-Type must be application/json" }, 415);
+  }
 
+  let body: Record<string, unknown>;
+  try {
+    body = await req.json();
+  } catch {
+    return json(req, { error: "Invalid request body" }, 400);
+  }
+
+  const audio = typeof body.audio === "string" ? body.audio : "";
+  const mimeType = typeof body.mimeType === "string" ? body.mimeType : "";
+  const today =
+    typeof body.today === "string" && /^\d{4}-\d{2}-\d{2}$/.test(body.today)
+      ? body.today
+      : new Date().toISOString().slice(0, 10);
+  const language = typeof body.language === "string" && body.language in LANGUAGES
+    ? body.language
+    : "en";
+
+  if (!audio || audio.length > MAX_BASE64_LENGTH) {
+    return json(req, { error: "Recording is missing or too large" }, audio ? 413 : 400);
+  }
+  if (!ALLOWED_MIME_TYPES.has(mimeType)) {
+    return json(req, { error: "Unsupported audio format" }, 415);
+  }
+
+  const knownHabits = limitedStrings(body.known_habits);
+  const knownCategories = limitedStrings(body.known_categories);
+  const languageName = LANGUAGES[language];
   const userText =
-    `Output language: ${langName}.\n` +
+    `Output language: ${languageName}.\n` +
     `known_habits: ${JSON.stringify(knownHabits)}\n` +
     `known_categories: ${JSON.stringify(knownCategories)}\n` +
-    `today: ${today}\n` +
-    `The audio is spoken in ${langName}. Transcribe it in ${langName}, and write each ` +
-    `entry's "name" and "category" as short, clean, capitalized labels in ${langName} (reuse a ` +
-    `known_habits / known_categories name if one matches). Always keep "raw_text" in the speaker's original words.`;
-
-  const geminiBody = {
-    systemInstruction: { parts: [{ text: SYSTEM_PROMPT }] },
-    contents: [
-      {
-        role: "user",
-        parts: [
-          { text: userText },
-          { inlineData: { mimeType, data: audioBase64 } },
-        ],
-      },
-    ],
-    generationConfig: {
-      responseMimeType: "application/json",
-      responseSchema: RESPONSE_SCHEMA,
-      temperature: 0.2,
-    },
-  };
+    `today: ${today}\nTranscribe in ${languageName} and keep raw_text in the speaker's words.`;
 
   const url =
-    `https://generativelanguage.googleapis.com/v1beta/models/${GEMINI_MODEL}:generateContent`;
-
+    `https://generativelanguage.googleapis.com/v1beta/models/${encodeURIComponent(GEMINI_MODEL)}:generateContent`;
   let geminiRes: Response;
   try {
     geminiRes = await fetch(url, {
@@ -202,62 +199,75 @@ Deno.serve(async (req: Request) => {
         "Content-Type": "application/json",
         "x-goog-api-key": GEMINI_API_KEY,
       },
-      body: JSON.stringify(geminiBody),
+      body: JSON.stringify({
+        systemInstruction: { parts: [{ text: SYSTEM_PROMPT }] },
+        contents: [{
+          role: "user",
+          parts: [{ text: userText }, { inlineData: { mimeType, data: audio } }],
+        }],
+        generationConfig: {
+          responseMimeType: "application/json",
+          responseSchema: RESPONSE_SCHEMA,
+          temperature: 0.2,
+        },
+      }),
+      signal: AbortSignal.timeout(25_000),
     });
-  } catch (e) {
-    return json({ error: "Failed to reach Gemini", detail: String(e) }, 502);
+  } catch {
+    return json(req, { error: "Speech processing timed out" }, 504);
   }
 
-  if (!geminiRes.ok) {
-    const detail = await geminiRes.text();
-    return json({ error: "Gemini error", status: geminiRes.status, detail }, 502);
-  }
-
-  // --- 3. Extract + validate the model's JSON -------------------------------
-  const data = await geminiRes.json();
-  const text: string =
-    data?.candidates?.[0]?.content?.parts
-      ?.map((p: { text?: string }) => p.text ?? "")
-      .join("") ?? "";
+  if (!geminiRes.ok) return json(req, { error: "Speech processing failed" }, 502);
 
   let parsed: { entries?: unknown };
   try {
+    const data = await geminiRes.json();
+    const text =
+      data?.candidates?.[0]?.content?.parts
+        ?.map((part: { text?: string }) => part.text ?? "")
+        .join("") ?? "";
     parsed = JSON.parse(text);
   } catch {
-    return json({ error: "Model did not return valid JSON", raw: text }, 502);
+    return json(req, { error: "Speech processing returned an invalid result" }, 502);
   }
 
-  // Normalize so the app always gets a clean, predictable shape.
-  const raw = Array.isArray(parsed?.entries) ? parsed.entries : [];
-  const entries = raw
-    .map((e: Record<string, unknown>) => {
-      const rawMeasures = Array.isArray(e?.measures) ? e.measures : [];
-      const measures = rawMeasures
-        .map((m: Record<string, unknown>) => {
-          const value =
-            typeof m?.value === "number" && Number.isFinite(m.value) ? m.value : null;
-          if (value === null) return null;
-          let kind = String(m?.kind ?? "count").toLowerCase();
-          if (!ALLOWED_KINDS.has(kind)) kind = "count";
-          const unit =
-            m?.unit != null && String(m.unit).trim() !== "" ? String(m.unit) : null;
-          return { kind, value, unit };
-        })
-        .filter((m): m is { kind: string; value: number; unit: string | null } => m !== null);
-      const category =
-        e?.category != null && String(e.category).trim() !== ""
-          ? String(e.category).trim()
-          : null;
+  const rawEntries = Array.isArray(parsed.entries) ? parsed.entries.slice(0, 20) : [];
+  const entries = rawEntries
+    .map((candidate: unknown) => {
+      const e = candidate && typeof candidate === "object"
+        ? candidate as Record<string, unknown>
+        : {};
+      const rawMeasures = Array.isArray(e.measures) ? e.measures.slice(0, 12) : [];
+      const measures = rawMeasures.flatMap((candidateMeasure: unknown) => {
+        const m = candidateMeasure && typeof candidateMeasure === "object"
+          ? candidateMeasure as Record<string, unknown>
+          : {};
+        const kind = String(m.kind ?? "").toLowerCase();
+        const value = typeof m.value === "number" ? m.value : Number.NaN;
+        const unit = m.unit == null || String(m.unit).trim() === ""
+          ? null
+          : String(m.unit).trim().toLowerCase();
+        if (
+          !ALLOWED_UNITS[kind] ||
+          !ALLOWED_UNITS[kind].has(unit) ||
+          !Number.isFinite(value) ||
+          value <= 0 ||
+          value > 1_000_000
+        ) return [];
+        return [{ kind, value, unit }];
+      });
+      const name = String(e.name ?? "").trim().slice(0, 80);
+      const categoryText = String(e.category ?? "").trim().slice(0, 80);
       return {
-        name: String(e?.name ?? "").trim(),
-        category,
+        name,
+        category: categoryText || null,
         measures,
-        raw_text: String(e?.raw_text ?? ""),
-        confident: e?.confident !== false,
-        log_date: typeof e?.log_date === "string" && e.log_date ? e.log_date : today,
+        raw_text: String(e.raw_text ?? "").trim().slice(0, 500),
+        confident: e.confident !== false,
+        log_date: today,
       };
     })
-    .filter((e) => e.name.length > 0);
+    .filter((entry) => entry.name.length > 0);
 
-  return json({ entries });
+  return json(req, { entries });
 });

@@ -73,7 +73,10 @@ export default function GoalModal({
   }, [visible, initial, amountEnabled]);
 
   const targetNum = parseFloat(target.replace(',', '.'));
-  const canSave = Number.isFinite(targetNum) && targetNum > 0;
+  const canSave =
+    Number.isFinite(targetNum) &&
+    targetNum > 0 &&
+    (type !== 'count' || (Number.isInteger(targetNum) && targetNum <= 7));
 
   const suffixText =
     type === 'count' ? t('daysPerWeekSuffix') : effHasUnit ? unitLabel(effUnit, t) : effLabel;
